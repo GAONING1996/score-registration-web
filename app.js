@@ -187,40 +187,11 @@
     state.recognition = null; state.recognitionRunning = false; state.pendingVoice = false;
     el.mic.textContent = '开始连续语音'; el.transcript.textContent = message;
   };
-  const startRecognition = async () => {
+  const startRecognition = () => {
     if (state.recognitionRunning) { stopRecognition(); return; }
-    if (window.desktopAPI?.isElectron) { await startBrowserVoiceBridge(); return; }
+    if (window.desktopAPI?.isElectron) { startBrowserVoiceBridge(); return; }
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) { toast('当前浏览器不支持语音识别，请使用最新版 Chrome 或 Edge'); return; }
-    try {
-      if (navigator.permissions?.query) {
-        const permission = await navigator.permissions.query({ name: 'microphone' });
-        if (permission.state === 'denied') { stopRecognition('语音状态：麦克风权限已被拒绝，请在地址栏网站权限中改为允许'); return; }
-      }
-    } catch {}
-    // Electron's Web Speech implementation does not always trigger the
-    // microphone permission flow by itself. Perform a short, explicit audio
-    // preflight so the packaged app can verify the device before recognition.
-    try {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        stopRecognition('语音状态：当前桌面环境无法访问麦克风，请检查系统权限');
-        return;
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      stream.getTracks().forEach((track) => track.stop());
-    } catch (error) {
-      const name = error?.name || '';
-      if (name === 'NotAllowedError' || name === 'SecurityError') {
-        stopRecognition('语音状态：麦克风权限未允许，请在 Windows 隐私设置中允许桌面应用使用麦克风');
-      } else if (name === 'NotFoundError' || name === 'NotReadableError') {
-        stopRecognition('语音状态：没有可用麦克风，或麦克风正被其他程序占用');
-      } else {
-        stopRecognition(`语音状态：麦克风初始化失败（${name || '未知错误'}）`);
-      }
-      return;
-    }
     const recognition = new SpeechRecognition();
     state.recognition = recognition;
     recognition.lang = 'zh-CN';
@@ -231,16 +202,23 @@
     state.lastSpeechAt = Date.now();
     el.mic.textContent = '停止语音';
     el.transcript.textContent = '语音状态：正在监听（首次使用请允许麦克风）';
+    const resetSessionTimer = () => {
+      clearTimeout(state.sessionTimer);
+      state.sessionTimer = setTimeout(() => {
+        if (state.recognitionRunning) stopRecognition('语音状态：30 秒没有收到语音识别结果，已自动停止');
+      }, 30000);
+    };
     const resetSilence = () => {
       state.lastSpeechAt = Date.now();
       clearTimeout(state.silenceTimer);
       state.silenceTimer = setTimeout(() => {
-        if (state.recognitionRunning) el.transcript.textContent = '语音状态：暂时没有声音，仍在等待';
+        if (state.recognitionRunning) el.transcript.textContent = '语音状态：尚未收到转写，仍在等待；如果已说话，请检查输入设备或语音服务网络';
       }, 10000);
     };
     recognition.onstart = resetSilence;
     recognition.onresult = (event) => {
       resetSilence();
+      resetSessionTimer();
       let finalText = '';
       let interim = '';
       for (let i = event.resultIndex; i < event.results.length; i += 1) {
@@ -263,9 +241,11 @@
       el.transcript.textContent = replaced ? `语音状态：已覆盖上一条待确认内容：${parsed.name} → ${parsed.score}` : `语音状态：等待确认：${parsed.name} → ${parsed.score}`;
     };
     recognition.onerror = (event) => {
+      clearTimeout(state.silenceTimer);
       el.transcript.textContent = `语音识别失败：${event.error}`;
       if (event.error === 'not-allowed') stopRecognition('语音状态：麦克风权限未允许，请检查地址栏权限');
-      else if (event.error === 'network') toast('语音服务网络连接失败；可检查网络后重试，或改用文字输入');
+      else if (event.error === 'service-not-allowed') stopRecognition('语音状态：浏览器或网络不允许使用语音识别，请检查浏览器策略和语音服务网络');
+      else if (event.error === 'network') stopRecognition('语音状态：浏览器语音服务网络连接失败，已停止自动重试；请检查网络后重新开始，或改用文字输入');
       else if (event.error === 'audio-capture') stopRecognition('语音状态：麦克风设备不可用');
       else if (event.error !== 'no-speech') toast(`语音识别失败：${event.error}`);
     };
@@ -273,7 +253,7 @@
       if (state.recognitionRunning) setTimeout(() => { if (state.recognitionRunning && state.recognition === recognition) { try { recognition.start(); } catch {} } }, 150);
     };
     try { recognition.start(); } catch (error) { stopRecognition('语音状态：无法启动识别，请稍后重试'); toast(error.message || '语音识别启动失败'); return; }
-    state.sessionTimer = setTimeout(() => { if (state.recognitionRunning) stopRecognition('语音状态：长时间没有有效记录，已自动停止'); }, 30000);
+    resetSessionTimer();
   };
   el.mic.addEventListener('click', startRecognition);
   renderCandidates([]);

@@ -1,12 +1,14 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const state = {
-    workbook: null, fileName: '', sheetName: '', scoreCol: 4,
+    workbook: null, sourceWorkbookData: null, fileName: '', sheetName: '', scoreCol: 4,
     headers: [], rows: [], className: '', candidates: [], history: [], orphan: [],
+    clearedRows: new Set(),
     recognitionRunning: false, recognition: null, recognitionStartedAt: 0,
     voiceBridge: false, voiceCursor: 0, voicePollTimer: null,
     voiceHelperOpened: false, voiceHelperEverConnected: false,
-    lastSpeechAt: 0, silenceTimer: null, sessionTimer: null, pendingVoice: false,
+    lastSpeechAt: 0, silenceTimer: null, sessionTimer: null, retryTimer: null,
+    networkFailureCount: 0, speechDiagnostics: {}, pendingVoice: false,
   };
   const el = {
     file: $('fileInput'), fileName: $('fileName'), sheet: $('sheetSelect'),
@@ -21,6 +23,7 @@
     toast: $('toast'),
   };
   const text = (v) => String(v ?? '').trim();
+  const cellKey = (row, column) => `${row.rowIndex}:${column}`;
   const normalize = (v) => text(v).toLowerCase().replace(/[\s·•・,，。．、'"“”‘’（）()\[\]【】]/g, '');
   const escapeHtml = (v) => text(v).replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
   const colName = (i) => { let out = ''; let n = i + 1; while (n) { const r = (n - 1) % 26; out = String.fromCharCode(65 + r) + out; n = Math.floor((n - 1) / 26); } return out; };
@@ -72,7 +75,7 @@
     const rows = currentRows(); const doneCount = rows.filter(isDone).length;
     el.total.textContent = rows.length; el.done.textContent = doneCount; el.todo.textContent = rows.length - doneCount; el.pending.textContent = doneCount;
     el.summary.textContent = `${state.className}班 · ${rows.length}人`; el.scope.textContent = `${state.sheetName} · ${state.className}班`;
-    const last = state.history[state.history.length - 1]; el.undo.disabled = !last; el.undo.textContent = last ? `撤销上一条：${last.row.name}（${last.row.className}班）→ ${last.newValue}` : '撤销上一条：暂无';
+    const last = state.history[state.history.length - 1]; el.undo.disabled = !last; el.undo.textContent = last ? `撤销上一条：${last.row.name}（${last.row.className}班）${last.newValue === '' ? '改为未登记' : `→ ${last.newValue}`}` : '撤销上一条：暂无';
     const pending = rows.filter((r) => !isDone(r));
     el.unreg.innerHTML = pending.length ? `<table><thead><tr><th>姓名</th><th>考试号</th><th>状态</th></tr></thead><tbody>${pending.map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.exam)}</td><td><span class="tag">未登记</span></td></tr>`).join('')}</tbody></table>` : '<div class="empty">本班学生已全部登记</div>';
     const registered = rows.filter(isDone);
@@ -164,10 +167,57 @@
   };
   const openModal = (confirm) => { el.backdrop.style.display = 'flex'; el.modalConfirm.onclick = () => { el.backdrop.style.display = 'none'; confirm(); }; el.modalCancel.onclick = () => { el.backdrop.style.display = 'none'; }; };
   const orphan = (reason) => { const value = scoreValue(el.score.value); if (value === null) { toast('请先填写有效成绩'); return; } state.orphan.push({ value, raw: el.name.value || '无姓名', reason, timestamp: Date.now() }); refreshStats(); clearInputs(); toast(`已记录无法匹配内容：${value}`); };
-  const duplicate = (row, value) => { if (!row) return; if (value === null) { toast('请先填写本次新成绩'); return; } el.modalTitle.textContent = '发现重复登记'; el.modalText.textContent = `${row.name}（${row.className}班，考试号 ${row.exam || '—'}）已有成绩：${row.values[state.scoreCol]}。本次识别为：${value}。`; el.modalBody.innerHTML = '<div class="field"><label>处理方式</label><select id="duplicateChoice"><option value="keep">保留原成绩</option><option value="replace">使用新成绩</option><option value="other">重新选择候选人</option><option value="skip">不登记本次记录</option></select></div>'; openModal(() => { const choice = $('duplicateChoice').value; if (choice === 'replace') { state.history.push({ row, oldValue: row.values[state.scoreCol], newValue: value, column: state.scoreCol, timestamp: Date.now() }); row.values[state.scoreCol] = value; refreshStats(); clearInputs(); resumeRecognition(); toast(`已替换 ${row.name} 的成绩`); } else if (choice === 'other') renderCandidates(findCandidates(el.name.value).filter((candidate) => candidate.name !== row.name)); else if (choice === 'skip') { orphan('重复记录未登记'); resumeRecognition(); } else resumeRecognition(); }); };
-  const commit = (row) => { const value = scoreValue(el.score.value); if (!row || value === null) { toast('请先填写有效成绩'); return; } if (isDone(row)) { duplicate(row, value); return; } state.history.push({ row, oldValue: row.values[state.scoreCol], newValue: value, column: state.scoreCol, timestamp: Date.now() }); row.values[state.scoreCol] = value; el.transcript.textContent = `已登记：${row.name}（${row.className}班）→ ${value}`; refreshStats(); clearInputs(); resumeRecognition(); toast(`已登记 ${row.name}：${value}`); };
-  el.file.addEventListener('change', async (event) => { const file = event.target.files?.[0]; if (!file) return; try { state.workbook = XLSX.read(await file.arrayBuffer(), { type: 'array', cellStyles: true }); state.fileName = file.name; el.fileName.textContent = file.name; el.sheet.innerHTML = state.workbook.SheetNames.map((s) => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join(''); el.sheet.disabled = false; el.sheet.dispatchEvent(new Event('change')); el.status.innerHTML = `<span class="tag ok">已读取 ${state.workbook.SheetNames.length} 张工作表</span>`; toast('Excel 已读取，未修改原文件'); } catch (error) { console.error(error); toast(`读取 Excel 失败：${error.message}`); } });
-  el.sheet.addEventListener('change', () => { state.sheetName = el.sheet.value; state.scoreCol = 4; buildRows(state.sheetName); state.scoreCol = defaultColumn(); el.col.innerHTML = scoreColumns().map((c) => `<option value="${c.index}">${escapeHtml(c.label)}${c.hasData ? ' · 已有数据' : ''}</option>`).join(''); el.col.value = String(state.scoreCol); el.col.disabled = false; const classes = [...new Set(state.rows.map((r) => r.className).filter(Boolean))]; el.cls.innerHTML = classes.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}班</option>`).join(''); el.cls.disabled = !classes.length; if (classes.length) el.cls.dispatchEvent(new Event('change')); });
+  const duplicate = (row, value) => {
+    if (!row) return;
+    const hasNewScore = value !== null;
+    el.modalTitle.textContent = '处理已登记成绩';
+    el.modalText.textContent = hasNewScore
+      ? `${row.name}（${row.className}班，考试号 ${row.exam || '—'}）已有成绩：${row.values[state.scoreCol]}。本次输入为：${value}。`
+      : `${row.name}（${row.className}班，考试号 ${row.exam || '—'}）当前成绩为：${row.values[state.scoreCol]}。可以清除成绩，将其改回未登记。`;
+    const options = ['<option value="keep">保留原成绩</option>', '<option value="clear">清除成绩，改为未登记</option>'];
+    if (hasNewScore) options.push('<option value="replace">使用本次新成绩</option>', '<option value="other">重新选择候选人</option>', '<option value="skip">不登记本次记录</option>');
+    el.modalBody.innerHTML = `<div class="field"><label>处理方式</label><select id="duplicateChoice">${options.join('')}</select></div>`;
+    openModal(() => {
+      const choice = $('duplicateChoice').value;
+      if (choice === 'clear') {
+        state.history.push({ row, oldValue: row.values[state.scoreCol], oldCleared: state.clearedRows.has(cellKey(row, state.scoreCol)), newValue: '', column: state.scoreCol, timestamp: Date.now() });
+        row.values[state.scoreCol] = '';
+        state.clearedRows.add(cellKey(row, state.scoreCol));
+        refreshStats(); clearInputs(); resumeRecognition();
+        toast(`已将 ${row.name} 改为未登记`);
+      } else if (choice === 'replace') {
+        state.history.push({ row, oldValue: row.values[state.scoreCol], oldCleared: state.clearedRows.has(cellKey(row, state.scoreCol)), newValue: value, column: state.scoreCol, timestamp: Date.now() });
+        row.values[state.scoreCol] = value;
+        state.clearedRows.delete(cellKey(row, state.scoreCol));
+        refreshStats(); clearInputs(); resumeRecognition(); toast(`已替换 ${row.name} 的成绩`);
+      } else if (choice === 'other') renderCandidates(findCandidates(el.name.value).filter((candidate) => candidate.rowIndex !== row.rowIndex));
+      else if (choice === 'skip') { orphan('重复记录未登记'); resumeRecognition(); }
+      else resumeRecognition();
+    });
+  };
+  const commit = (row) => {
+    const value = scoreValue(el.score.value);
+    if (!row || value === null) { toast('请先填写有效成绩'); return; }
+    if (isDone(row)) { duplicate(row, value); return; }
+    state.history.push({ row, oldValue: row.values[state.scoreCol], oldCleared: state.clearedRows.has(cellKey(row, state.scoreCol)), newValue: value, column: state.scoreCol, timestamp: Date.now() });
+    row.values[state.scoreCol] = value;
+    state.clearedRows.delete(cellKey(row, state.scoreCol));
+    el.transcript.textContent = `已登记：${row.name}（${row.className}班）→ ${value}`;
+    refreshStats(); clearInputs(); resumeRecognition(); toast(`已登记 ${row.name}：${value}`);
+  };
+  el.file.addEventListener('change', async (event) => {
+    const file = event.target.files?.[0]; if (!file) return;
+    try {
+      state.sourceWorkbookData = await file.arrayBuffer();
+      state.workbook = XLSX.read(state.sourceWorkbookData.slice(0), { type: 'array', cellStyles: true });
+      state.fileName = file.name; el.fileName.textContent = file.name;
+      el.sheet.innerHTML = state.workbook.SheetNames.map((s) => `<option value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('');
+      el.sheet.disabled = false; el.sheet.dispatchEvent(new Event('change'));
+      el.status.innerHTML = `<span class="tag ok">已读取 ${state.workbook.SheetNames.length} 张工作表</span>`;
+      toast('Excel 已读取，未修改原文件');
+    } catch (error) { console.error(error); toast(`读取 Excel 失败：${error.message}`); }
+  });
+  el.sheet.addEventListener('change', () => { state.sheetName = el.sheet.value; state.scoreCol = 4; state.clearedRows = new Set(); buildRows(state.sheetName); state.scoreCol = defaultColumn(); el.col.innerHTML = scoreColumns().map((c) => `<option value="${c.index}">${escapeHtml(c.label)}${c.hasData ? ' · 已有数据' : ''}</option>`).join(''); el.col.value = String(state.scoreCol); el.col.disabled = false; const classes = [...new Set(state.rows.map((r) => r.className).filter(Boolean))]; el.cls.innerHTML = classes.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}班</option>`).join(''); el.cls.disabled = !classes.length; if (classes.length) el.cls.dispatchEvent(new Event('change')); });
   el.col.addEventListener('change', () => { state.scoreCol = Number(el.col.value); refreshStats(); });
   el.cls.addEventListener('change', () => { state.className = el.cls.value; state.history = []; state.orphan = []; setEnabled(true); refreshStats(); clearInputs(); });
   let searchTimer = null;
@@ -175,11 +225,37 @@
   el.clear.addEventListener('click', () => { clearInputs(); toast('已清除当前录入内容'); });
   el.name.addEventListener('input', liveSearch);
   [el.name, el.score].forEach((input) => input.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); liveSearch(); } }));
-  el.undo.addEventListener('click', () => { const item = state.history.pop(); if (!item) return; item.row.values[item.column ?? state.scoreCol] = item.oldValue; refreshStats(); toast(`已撤销 ${item.row.name} 的登记：恢复为 ${item.oldValue || '空白'}`); });
-  el.export.addEventListener('click', () => { if (!state.workbook) return; const sheet = state.workbook.Sheets[state.sheetName]; state.rows.forEach((row) => { const address = XLSX.utils.encode_cell({ r: row.rowIndex, c: state.scoreCol }); sheet[address] = { t: typeof row.values[state.scoreCol] === 'number' ? 'n' : 's', v: row.values[state.scoreCol] }; }); const output = XLSX.write(state.workbook, { bookType: 'xlsx', type: 'array', cellStyles: true }); const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([output], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })); link.download = state.fileName.replace(/\.(xlsx|xls)$/i, '') + '_登记完成.xlsx'; link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000); toast('已下载登记后的 Excel'); });
+  el.undo.addEventListener('click', () => {
+    const item = state.history.pop(); if (!item) return;
+    const column = item.column ?? state.scoreCol;
+    item.row.values[column] = item.oldValue;
+    const key = cellKey(item.row, column);
+    if (item.oldCleared) state.clearedRows.add(key);
+    else state.clearedRows.delete(key);
+    refreshStats(); toast(`已撤销 ${item.row.name} 的成绩操作`);
+  });
+  el.export.addEventListener('click', () => {
+    if (!state.sourceWorkbookData) return;
+    const outputWorkbook = XLSX.read(state.sourceWorkbookData.slice(0), { type: 'array', cellStyles: true });
+    const sheet = outputWorkbook.Sheets[state.sheetName];
+    state.rows.forEach((row) => {
+      const value = row.values[state.scoreCol];
+      const address = XLSX.utils.encode_cell({ r: row.rowIndex, c: state.scoreCol });
+      if (text(value) === '') {
+        if (state.clearedRows.has(cellKey(row, state.scoreCol))) delete sheet[address];
+        return;
+      }
+      sheet[address] = { t: typeof value === 'number' ? 'n' : 's', v: value };
+    });
+    const output = XLSX.write(outputWorkbook, { bookType: 'xlsx', type: 'array', cellStyles: true });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([output], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+    link.download = state.fileName.replace(/\.(xlsx|xls)$/i, '') + '_登记完成.xlsx';
+    link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000); toast('已下载登记后的 Excel');
+  });
   const resumeRecognition = () => { if (!state.recognitionRunning) return; state.pendingVoice = false; el.transcript.textContent = '语音状态：正在监听下一张试卷'; if (state.recognition) { try { state.recognition.start(); } catch {} } };
   const stopRecognition = (message = '语音状态：已停止') => {
-    clearTimeout(state.silenceTimer); clearTimeout(state.sessionTimer);
+    clearTimeout(state.silenceTimer); clearTimeout(state.sessionTimer); clearTimeout(state.retryTimer);
     if (state.voicePollTimer) { clearInterval(state.voicePollTimer); state.voicePollTimer = null; }
     if (state.voiceBridge) sendVoiceControl('stop');
     state.voiceBridge = false;
@@ -194,6 +270,7 @@
     if (!SpeechRecognition) { toast('当前浏览器不支持语音识别，请使用最新版 Chrome 或 Edge'); return; }
     const recognition = new SpeechRecognition();
     state.recognition = recognition;
+    state.networkFailureCount = 0;
     recognition.lang = 'zh-CN';
     recognition.continuous = true;
     recognition.interimResults = true;
@@ -212,13 +289,32 @@
       state.lastSpeechAt = Date.now();
       clearTimeout(state.silenceTimer);
       state.silenceTimer = setTimeout(() => {
-        if (state.recognitionRunning) el.transcript.textContent = '语音状态：尚未收到转写，仍在等待；如果已说话，请检查输入设备或语音服务网络';
+        if (state.recognitionRunning && !state.speechDiagnostics.speechDetected) el.transcript.textContent = '语音状态：尚未收到转写，仍在等待；请留意是否检测到麦克风声音';
       }, 10000);
     };
-    recognition.onstart = resetSilence;
+    recognition.onstart = () => {
+      state.speechDiagnostics = { audioStarted: false, soundDetected: false, speechDetected: false };
+      resetSilence();
+      el.transcript.textContent = state.networkFailureCount
+        ? `语音状态：正在重试识别服务（${state.networkFailureCount}/${MAX_NETWORK_FAILURES}）`
+        : '语音状态：已启动，等待麦克风音频';
+    };
+    recognition.onaudiostart = () => {
+      state.speechDiagnostics.audioStarted = true;
+      el.transcript.textContent = '语音状态：麦克风采集已启动，等待声音';
+    };
+    recognition.onsoundstart = () => {
+      state.speechDiagnostics.soundDetected = true;
+      el.transcript.textContent = '语音状态：已检测到麦克风声音';
+    };
+    recognition.onspeechstart = () => {
+      state.speechDiagnostics.speechDetected = true;
+      el.transcript.textContent = '语音状态：已检测到说话，等待识别转写';
+    };
     recognition.onresult = (event) => {
       resetSilence();
       resetSessionTimer();
+      state.networkFailureCount = 0;
       let finalText = '';
       let interim = '';
       for (let i = event.resultIndex; i < event.results.length; i += 1) {
@@ -242,19 +338,42 @@
     };
     recognition.onerror = (event) => {
       clearTimeout(state.silenceTimer);
-      el.transcript.textContent = `语音识别失败：${event.error}`;
+      const detail = event.message ? `（${text(event.message).slice(0, 120)}）` : '';
+      el.transcript.textContent = `语音识别失败：${event.error}${detail}`;
       if (event.error === 'not-allowed') stopRecognition('语音状态：麦克风权限未允许，请检查地址栏权限');
       else if (event.error === 'service-not-allowed') stopRecognition('语音状态：浏览器或网络不允许使用语音识别，请检查浏览器策略和语音服务网络');
-      else if (event.error === 'network') stopRecognition('语音状态：浏览器语音服务网络连接失败，已停止自动重试；请检查网络后重新开始，或改用文字输入');
+      else if (event.error === 'network') {
+        state.networkFailureCount += 1;
+        const captureState = state.speechDiagnostics.speechDetected
+          ? '已检测到说话，但服务没有返回转写'
+          : state.speechDiagnostics.soundDetected
+            ? '已检测到麦克风声音'
+            : state.speechDiagnostics.audioStarted
+              ? '采集已启动，但没有检测到声音'
+              : '尚未确认麦克风采集启动';
+        if (state.networkFailureCount >= MAX_NETWORK_FAILURES) {
+          stopRecognition(`语音状态：${captureState}；连续 ${MAX_NETWORK_FAILURES} 次语音服务通信失败，已停止。${detail}`);
+        } else {
+          el.transcript.textContent = `语音状态：${captureState}；语音服务通信失败，将重试（${state.networkFailureCount}/${MAX_NETWORK_FAILURES}）${detail}`;
+        }
+      }
       else if (event.error === 'audio-capture') stopRecognition('语音状态：麦克风设备不可用');
       else if (event.error !== 'no-speech') toast(`语音识别失败：${event.error}`);
     };
     recognition.onend = () => {
-      if (state.recognitionRunning) setTimeout(() => { if (state.recognitionRunning && state.recognition === recognition) { try { recognition.start(); } catch {} } }, 150);
+      if (!state.recognitionRunning) return;
+      const delays = [150, 700, 1600];
+      const delay = state.networkFailureCount ? delays[Math.min(state.networkFailureCount, delays.length) - 1] : delays[0];
+      state.retryTimer = setTimeout(() => {
+        if (!state.recognitionRunning || state.recognition !== recognition) return;
+        try { recognition.start(); }
+        catch { stopRecognition('语音状态：浏览器无法重启识别会话，请重新开始语音'); }
+      }, delay);
     };
     try { recognition.start(); } catch (error) { stopRecognition('语音状态：无法启动识别，请稍后重试'); toast(error.message || '语音识别启动失败'); return; }
     resetSessionTimer();
   };
+  const MAX_NETWORK_FAILURES = 3;
   el.mic.addEventListener('click', startRecognition);
   renderCandidates([]);
 })();

@@ -22,6 +22,7 @@
     modalBody: $('modalBody'), modalCancel: $('modalCancel'), modalConfirm: $('modalConfirm'),
     toast: $('toast'),
   };
+  const VOICE_SESSION_MAX_MS = 15000;
   const text = (v) => String(v ?? '').trim();
   const cellKey = (row, column) => `${row.rowIndex}:${column}`;
   const normalize = (v) => text(v).toLowerCase().replace(/[\s·•・,，。．、'"“”‘’（）()\[\]【】]/g, '');
@@ -51,11 +52,37 @@
     if (s.includes('.')) { const [whole, dec] = s.split('.'); const w = chineseNumber(whole); const d = [...dec].map((ch) => chineseNumber(ch)).join(''); return w === null || !d ? null : Number(`${w}.${d}`); }
     return chineseNumber(s);
   };
+  const setMicButton = (listening) => {
+    el.mic.classList.toggle('listening', listening);
+    el.mic.textContent = listening ? '停止语音' : '开始语音';
+    el.mic.setAttribute('aria-pressed', String(listening));
+    el.mic.title = listening ? '停止本次语音输入' : '开始一次语音输入';
+  };
   const parseSpeech = (v) => {
     const raw = text(v).replace(/(这个是|这是|同学|的成绩|的分数|成绩是|分数是|分数为|得分|分数|成绩|考了|考得|分$)/g, ' ').replace(/\s+/g, ' ').trim();
-    const nums = raw.match(/\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百点]+/g);
-    const last = nums?.[nums.length - 1]; const index = last ? raw.lastIndexOf(last) : -1;
-    return { name: index >= 0 ? raw.slice(0, index).replace(/[，,：:；;\s]+$/, '').trim() : raw, score: last ? scoreValue(last) : null };
+    const arabic = raw.match(/-?\d+(?:\.\d+)?/g);
+    if (arabic?.length) {
+      const last = arabic[arabic.length - 1]; const index = raw.lastIndexOf(last);
+      return { name: raw.slice(0, index).replace(/[，,：:；;\s]+$/, '').trim(), score: scoreValue(last) };
+    }
+    const compact = normalize(raw);
+    const rosterParse = currentRows().map((row) => {
+      const nameKey = normalize(row.name);
+      if (!nameKey || !compact.startsWith(nameKey)) return null;
+      const scoreText = compact.slice(nameKey.length);
+      const score = scoreValue(scoreText);
+      return scoreText && score !== null ? { name: row.name, score, nameLength: nameKey.length } : null;
+    }).filter(Boolean).sort((a, b) => b.nameLength - a.nameLength)[0];
+    if (rosterParse) return { name: rosterParse.name, score: rosterParse.score };
+
+    const chinese = raw.match(/[零〇一二两三四五六七八九十百点]+$/)?.[0];
+    if (chinese) {
+      const index = raw.length - chinese.length;
+      if (index > 0 && /[，,：:；;\s]/.test(raw[index - 1])) {
+        return { name: raw.slice(0, index).replace(/[，,：:；;\s]+$/, '').trim(), score: scoreValue(chinese) };
+      }
+    }
+    return { name: raw, score: null };
   };
   const toast = (msg) => { el.toast.textContent = msg; el.toast.classList.add('show'); clearTimeout(toast.timer); toast.timer = setTimeout(() => el.toast.classList.remove('show'), 2600); };
   const currentRows = () => state.rows.filter((r) => r.className === state.className);
@@ -98,44 +125,97 @@
     document.querySelectorAll('.duplicate').forEach((button) => button.addEventListener('click', () => duplicate(state.candidates[Number(button.dataset.index)], scoreValue(el.score.value))));
     $('noRegister')?.addEventListener('click', () => orphan('用户选择不登记'));
   };
-  const clearInputs = () => { el.name.value = ''; el.score.value = ''; state.candidates = []; el.candidates.innerHTML = '<div class="empty">等待新的姓名或语音输入</div>'; state.pendingVoice = false; el.name.focus(); el.transcript.textContent = state.recognitionRunning ? '语音状态：正在监听下一张试卷' : '语音转写：尚未开始'; };
+  const clearInputs = () => {
+    el.name.value = ''; el.score.value = ''; state.candidates = [];
+    el.candidates.innerHTML = '<div class="empty">等待新的姓名或语音输入</div>';
+    state.pendingVoice = false; el.name.focus();
+    el.transcript.textContent = state.recognitionRunning ? '语音状态：正在监听；当前内容已清除' : '语音转写：尚未开始';
+  };
   const voiceToken = new URLSearchParams(location.search).get('token') || '';
   const voiceApi = (path) => `${path}${path.includes('?') ? '&' : '?'}token=${encodeURIComponent(voiceToken)}`;
   const sendVoiceControl = (action) => fetch(voiceApi('/voice/control'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }) }).catch(() => {});
-  const handleSpeechFinal = (finalText) => {
-    const parsed = parseSpeech(finalText);
-    if (!parsed.name || parsed.score === null) {
-      el.transcript.textContent = state.pendingVoice ? '语音状态：本句不完整，保留当前待确认内容' : '语音状态：姓名或成绩不完整，请补充或选择不登记';
+  const armVoiceSessionTimer = () => {
+    clearTimeout(state.sessionTimer);
+    state.sessionTimer = setTimeout(() => {
+      if (state.recognitionRunning) stopRecognition('语音状态：达到 15 秒上限，已自动停止；已识别的内容已保留');
+    }, VOICE_SESSION_MAX_MS);
+  };
+  const voiceMatchIsReliable = (query, candidates) => {
+    const best = candidates[0];
+    if (!best || best.score < 82) return false;
+    const queryKey = normalize(query);
+    const exactMatches = candidates.filter((candidate) => normalize(candidate.name) === queryKey);
+    if (exactMatches.length) return exactMatches.length === 1;
+    const queryHasEnoughSignal = [...queryKey].filter((ch) => /[\u3400-\u9fff]/.test(ch)).length >= 2 || (/^[a-z]+$/.test(queryKey) && queryKey.length >= 4);
+    const margin = best.score - (candidates[1]?.score ?? 0);
+    return queryHasEnoughSignal && margin >= 8;
+  };
+  const acceptVoiceDraft = (name, score, candidates) => {
+    const replaced = state.pendingVoice;
+    state.pendingVoice = true;
+    el.name.value = name;
+    el.score.value = score;
+    renderCandidates(candidates);
+    el.transcript.textContent = replaced
+      ? `语音状态：已用本次识别覆盖当前语音内容：${name} → ${score}`
+      : `语音状态：等待确认：${name} → ${score}`;
+  };
+  const showVoiceAlternatives = (parsed, candidates) => {
+    if (!candidates.length) {
+      el.transcript.textContent = state.pendingVoice
+        ? `语音状态：本次听到“${parsed.name}，${parsed.score}”，本班没有匹配候选；当前语音内容保留`
+        : `语音状态：本次听到“${parsed.name}，${parsed.score}”，本班没有匹配候选`;
       return;
     }
     const replaced = state.pendingVoice;
     state.pendingVoice = true;
     el.name.value = parsed.name;
     el.score.value = parsed.score;
-    renderCandidates(findCandidates(parsed.name));
-    el.transcript.textContent = replaced ? `语音状态：已覆盖上一条待确认内容：${parsed.name} → ${parsed.score}` : `语音状态：等待确认：${parsed.name} → ${parsed.score}`;
+    state.candidates = candidates;
+    el.transcript.textContent = replaced
+      ? `语音状态：本次识别已替换当前内容，请确认姓名候选：${parsed.name} → ${parsed.score}`
+      : `语音状态：本次识别待确认，请确认姓名候选：${parsed.name} → ${parsed.score}`;
+    el.candidates.innerHTML = `<div class="voice-alternative-note">本次识别：${escapeHtml(parsed.name)} · ${escapeHtml(parsed.score)}。选中正确学生即可登记；已登记学生会进入重复成绩处理。</div>${candidates.map((candidate, index) => `<div class="candidate"><div><div class="name">${escapeHtml(candidate.name)}</div><div class="meta">${escapeHtml(candidate.className)}班 · 考试号 ${escapeHtml(candidate.exam || '—')} · ${escapeHtml(candidate.reason)} · 匹配 ${candidate.score}</div></div><div class="right"><span class="mini-status ${candidate.isDone ? 'done' : 'todo'}">${candidate.isDone ? '已登记' : '未登记'}</span><button class="btn ${candidate.isDone ? 'light' : 'primary'} registerVoiceCandidate" data-index="${index}">${candidate.isDone ? '处理重复' : `登记 ${escapeHtml(parsed.score)}`}</button></div></div>`).join('')}`;
+    document.querySelectorAll('.registerVoiceCandidate').forEach((button) => button.addEventListener('click', () => {
+      const candidate = state.candidates[Number(button.dataset.index)];
+      if (candidate) commit(candidate);
+    }));
+  };
+  const handleSpeechFinal = (finalText) => {
+    const parsed = parseSpeech(finalText);
+    if (!parsed.name || parsed.score === null || !Number.isFinite(parsed.score) || parsed.score < 0) {
+      el.transcript.textContent = state.pendingVoice ? '语音状态：本句不完整或分数无效，保留当前待确认内容' : '语音状态：姓名或成绩不完整，请重新读一次或改用文字输入';
+      return;
+    }
+    const candidates = findCandidates(parsed.name);
+    if (!voiceMatchIsReliable(parsed.name, candidates)) {
+      showVoiceAlternatives(parsed, candidates);
+      return;
+    }
+    acceptVoiceDraft(parsed.name, parsed.score, candidates);
   };
   const startBrowserVoiceBridge = async () => {
     state.voiceBridge = true;
     state.recognitionRunning = true;
     state.voiceCursor = 0;
-    el.mic.textContent = '停止语音';
+    setMicButton(true);
+    armVoiceSessionTimer();
     el.transcript.textContent = state.voiceHelperOpened ? '语音状态：正在连接已打开的浏览器语音窗口' : '语音状态：首次使用将打开一次浏览器语音窗口';
     await sendVoiceControl('start');
+    if (!state.voiceBridge || !state.recognitionRunning) return;
     if (!state.voiceHelperOpened) {
       state.voiceHelperEverConnected = false;
       try {
         await window.desktopAPI.openVoiceHelper();
         state.voiceHelperOpened = true;
       } catch (error) {
-        state.voiceBridge = false;
-        state.recognitionRunning = false;
-        el.mic.textContent = '开始连续语音';
-        el.transcript.textContent = '语音状态：无法打开浏览器语音窗口';
+        stopRecognition('语音状态：无法打开浏览器语音窗口');
         toast(error?.message || '无法打开浏览器语音窗口');
         return;
       }
     }
+    if (!state.voiceBridge || !state.recognitionRunning) return;
+    if (state.pendingVoice) clearInputs();
     if (state.voicePollTimer) clearInterval(state.voicePollTimer);
     state.voicePollTimer = setInterval(async () => {
       try {
@@ -161,14 +241,21 @@
             el.transcript.textContent = `语音状态：${event.message}`;
           }
         }
-        if (!data.active && state.voiceBridge) stopRecognition('语音状态：已停止监听，可继续录入下一张试卷');
+        if (!data.active && state.voiceBridge) stopRecognition('语音状态：已停止；下一条请重新点击开始语音');
       } catch {}
     }, 180);
   };
   const openModal = (confirm) => { el.backdrop.style.display = 'flex'; el.modalConfirm.onclick = () => { el.backdrop.style.display = 'none'; confirm(); }; el.modalCancel.onclick = () => { el.backdrop.style.display = 'none'; }; };
-  const orphan = (reason) => { const value = scoreValue(el.score.value); if (value === null) { toast('请先填写有效成绩'); return; } state.orphan.push({ value, raw: el.name.value || '无姓名', reason, timestamp: Date.now() }); refreshStats(); clearInputs(); toast(`已记录无法匹配内容：${value}`); };
+  const orphan = (reason) => {
+    const value = scoreValue(el.score.value);
+    if (value === null) { toast('请先填写有效成绩'); return; }
+    if (state.recognitionRunning) stopRecognition('语音状态：已停止');
+    state.orphan.push({ value, raw: el.name.value || '无姓名', reason, timestamp: Date.now() });
+    refreshStats(); clearInputs(); toast(`已记录无法匹配内容：${value}`);
+  };
   const duplicate = (row, value) => {
     if (!row) return;
+    if (state.recognitionRunning) stopRecognition('语音状态：已停止，正在处理已登记学生');
     const hasNewScore = value !== null;
     el.modalTitle.textContent = '处理已登记成绩';
     el.modalText.textContent = hasNewScore
@@ -183,27 +270,29 @@
         state.history.push({ row, oldValue: row.values[state.scoreCol], oldCleared: state.clearedRows.has(cellKey(row, state.scoreCol)), newValue: '', column: state.scoreCol, timestamp: Date.now() });
         row.values[state.scoreCol] = '';
         state.clearedRows.add(cellKey(row, state.scoreCol));
-        refreshStats(); clearInputs(); resumeRecognition();
+        refreshStats(); clearInputs();
         toast(`已将 ${row.name} 改为未登记`);
       } else if (choice === 'replace') {
         state.history.push({ row, oldValue: row.values[state.scoreCol], oldCleared: state.clearedRows.has(cellKey(row, state.scoreCol)), newValue: value, column: state.scoreCol, timestamp: Date.now() });
         row.values[state.scoreCol] = value;
         state.clearedRows.delete(cellKey(row, state.scoreCol));
-        refreshStats(); clearInputs(); resumeRecognition(); toast(`已替换 ${row.name} 的成绩`);
+        refreshStats(); clearInputs(); toast(`已替换 ${row.name} 的成绩`);
       } else if (choice === 'other') renderCandidates(findCandidates(el.name.value).filter((candidate) => candidate.rowIndex !== row.rowIndex));
-      else if (choice === 'skip') { orphan('重复记录未登记'); resumeRecognition(); }
-      else resumeRecognition();
+      else if (choice === 'skip') orphan('重复记录未登记');
+      else clearInputs();
     });
   };
   const commit = (row) => {
     const value = scoreValue(el.score.value);
     if (!row || value === null) { toast('请先填写有效成绩'); return; }
+    if (state.recognitionRunning) stopRecognition('语音状态：已停止，正在登记当前成绩');
     if (isDone(row)) { duplicate(row, value); return; }
     state.history.push({ row, oldValue: row.values[state.scoreCol], oldCleared: state.clearedRows.has(cellKey(row, state.scoreCol)), newValue: value, column: state.scoreCol, timestamp: Date.now() });
     row.values[state.scoreCol] = value;
     state.clearedRows.delete(cellKey(row, state.scoreCol));
-    el.transcript.textContent = `已登记：${row.name}（${row.className}班）→ ${value}`;
-    refreshStats(); clearInputs(); resumeRecognition(); toast(`已登记 ${row.name}：${value}`);
+    refreshStats(); clearInputs();
+    el.transcript.textContent = `已登记：${row.name}（${row.className}班）→ ${value}。下一位请重新开始语音输入。`;
+    toast(`已登记 ${row.name}：${value}`);
   };
   el.file.addEventListener('change', async (event) => {
     const file = event.target.files?.[0]; if (!file) return;
@@ -219,11 +308,15 @@
   });
   el.sheet.addEventListener('change', () => { state.sheetName = el.sheet.value; state.scoreCol = 4; state.clearedRows = new Set(); buildRows(state.sheetName); state.scoreCol = defaultColumn(); el.col.innerHTML = scoreColumns().map((c) => `<option value="${c.index}">${escapeHtml(c.label)}${c.hasData ? ' · 已有数据' : ''}</option>`).join(''); el.col.value = String(state.scoreCol); el.col.disabled = false; const classes = [...new Set(state.rows.map((r) => r.className).filter(Boolean))]; el.cls.innerHTML = classes.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}班</option>`).join(''); el.cls.disabled = !classes.length; if (classes.length) el.cls.dispatchEvent(new Event('change')); });
   el.col.addEventListener('change', () => { state.scoreCol = Number(el.col.value); refreshStats(); });
-  el.cls.addEventListener('change', () => { state.className = el.cls.value; state.history = []; state.orphan = []; setEnabled(true); refreshStats(); clearInputs(); });
+  el.cls.addEventListener('change', () => {
+    if (state.recognitionRunning) stopRecognition('语音状态：班级已切换，语音输入已停止');
+    state.className = el.cls.value; state.history = []; state.orphan = []; setEnabled(true); refreshStats(); clearInputs();
+  });
   let searchTimer = null;
   const liveSearch = () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { const query = text(el.name.value); renderCandidates(query ? findCandidates(query) : []); }, 120); };
   el.clear.addEventListener('click', () => { clearInputs(); toast('已清除当前录入内容'); });
-  el.name.addEventListener('input', liveSearch);
+  el.name.addEventListener('input', () => { state.pendingVoice = false; liveSearch(); });
+  el.score.addEventListener('input', () => { state.pendingVoice = false; });
   [el.name, el.score].forEach((input) => input.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); liveSearch(); } }));
   el.undo.addEventListener('click', () => {
     const item = state.history.pop(); if (!item) return;
@@ -253,21 +346,21 @@
     link.download = state.fileName.replace(/\.(xlsx|xls)$/i, '') + '_登记完成.xlsx';
     link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000); toast('已下载登记后的 Excel');
   });
-  const resumeRecognition = () => { if (!state.recognitionRunning) return; state.pendingVoice = false; el.transcript.textContent = '语音状态：正在监听下一张试卷'; if (state.recognition) { try { state.recognition.start(); } catch {} } };
   const stopRecognition = (message = '语音状态：已停止') => {
     clearTimeout(state.silenceTimer); clearTimeout(state.sessionTimer); clearTimeout(state.retryTimer);
     if (state.voicePollTimer) { clearInterval(state.voicePollTimer); state.voicePollTimer = null; }
     if (state.voiceBridge) sendVoiceControl('stop');
     state.voiceBridge = false;
     if (state.recognition) { try { state.recognition.onend = null; state.recognition.stop(); } catch {} }
-    state.recognition = null; state.recognitionRunning = false; state.pendingVoice = false;
-    el.mic.textContent = '开始连续语音'; el.transcript.textContent = message;
+    state.recognition = null; state.recognitionRunning = false;
+    setMicButton(false); el.transcript.textContent = message;
   };
   const startRecognition = () => {
-    if (state.recognitionRunning) { stopRecognition(); return; }
-    if (window.desktopAPI?.isElectron) { startBrowserVoiceBridge(); return; }
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) { toast('当前浏览器不支持语音识别，请使用最新版 Chrome 或 Edge'); return; }
+    if (state.recognitionRunning) { stopRecognition('语音状态：已手动停止；当前识别内容已保留'); return; }
+    const isElectron = window.desktopAPI?.isElectron;
+    const SpeechRecognition = isElectron ? null : (window.SpeechRecognition || window.webkitSpeechRecognition);
+    if (!isElectron && !SpeechRecognition) { toast('当前浏览器不支持语音识别，请使用最新版 Chrome 或 Edge'); return; }
+    if (isElectron) { startBrowserVoiceBridge(); return; }
     const recognition = new SpeechRecognition();
     state.recognition = recognition;
     state.networkFailureCount = 0;
@@ -277,43 +370,38 @@
     state.recognitionRunning = true;
     state.recognitionStartedAt = Date.now();
     state.lastSpeechAt = Date.now();
-    el.mic.textContent = '停止语音';
-    el.transcript.textContent = '语音状态：正在监听（首次使用请允许麦克风）';
-    const resetSessionTimer = () => {
-      clearTimeout(state.sessionTimer);
-      state.sessionTimer = setTimeout(() => {
-        if (state.recognitionRunning) stopRecognition('语音状态：30 秒没有收到语音识别结果，已自动停止');
-      }, 30000);
-    };
+    setMicButton(true);
+    el.transcript.textContent = '语音状态：正在监听，报出姓名和成绩；再点红色按钮可停止';
+    armVoiceSessionTimer();
     const resetSilence = () => {
       state.lastSpeechAt = Date.now();
       clearTimeout(state.silenceTimer);
       state.silenceTimer = setTimeout(() => {
-        if (state.recognitionRunning && !state.speechDiagnostics.speechDetected) el.transcript.textContent = '语音状态：尚未收到转写，仍在等待；请留意是否检测到麦克风声音';
+        if (state.recognitionRunning && !state.pendingVoice && !state.speechDiagnostics.speechDetected) el.transcript.textContent = '语音状态：尚未收到转写，仍在等待；再点红色按钮可停止';
       }, 10000);
     };
     recognition.onstart = () => {
+      if (state.pendingVoice) clearInputs();
       state.speechDiagnostics = { audioStarted: false, soundDetected: false, speechDetected: false };
       resetSilence();
       el.transcript.textContent = state.networkFailureCount
         ? `语音状态：正在重试识别服务（${state.networkFailureCount}/${MAX_NETWORK_FAILURES}）`
-        : '语音状态：已启动，等待麦克风音频';
+        : '语音状态：正在监听；15 秒内可反复报姓名和成绩，下一句有效结果会替换当前结果';
     };
     recognition.onaudiostart = () => {
       state.speechDiagnostics.audioStarted = true;
-      el.transcript.textContent = '语音状态：麦克风采集已启动，等待声音';
+      if (!state.pendingVoice) el.transcript.textContent = '语音状态：麦克风已启动，等待姓名和成绩';
     };
     recognition.onsoundstart = () => {
       state.speechDiagnostics.soundDetected = true;
-      el.transcript.textContent = '语音状态：已检测到麦克风声音';
+      if (!state.pendingVoice) el.transcript.textContent = '语音状态：已检测到声音';
     };
     recognition.onspeechstart = () => {
       state.speechDiagnostics.speechDetected = true;
-      el.transcript.textContent = '语音状态：已检测到说话，等待识别转写';
+      if (!state.pendingVoice) el.transcript.textContent = '语音状态：已检测到说话，等待转写';
     };
     recognition.onresult = (event) => {
       resetSilence();
-      resetSessionTimer();
       state.networkFailureCount = 0;
       let finalText = '';
       let interim = '';
@@ -324,17 +412,7 @@
       }
       el.transcript.textContent = `语音转写：${finalText || interim}`;
       if (!finalText) return;
-      const parsed = parseSpeech(finalText);
-      if (!parsed.name || parsed.score === null) {
-        el.transcript.textContent = state.pendingVoice ? '语音状态：本句不完整，保留当前待确认内容' : '语音状态：姓名或成绩不完整，请补充或选择不登记';
-        return;
-      }
-      const replaced = state.pendingVoice;
-      state.pendingVoice = true;
-      el.name.value = parsed.name;
-      el.score.value = parsed.score;
-      renderCandidates(findCandidates(parsed.name));
-      el.transcript.textContent = replaced ? `语音状态：已覆盖上一条待确认内容：${parsed.name} → ${parsed.score}` : `语音状态：等待确认：${parsed.name} → ${parsed.score}`;
+      handleSpeechFinal(finalText);
     };
     recognition.onerror = (event) => {
       clearTimeout(state.silenceTimer);
@@ -371,7 +449,6 @@
       }, delay);
     };
     try { recognition.start(); } catch (error) { stopRecognition('语音状态：无法启动识别，请稍后重试'); toast(error.message || '语音识别启动失败'); return; }
-    resetSessionTimer();
   };
   const MAX_NETWORK_FAILURES = 3;
   el.mic.addEventListener('click', startRecognition);

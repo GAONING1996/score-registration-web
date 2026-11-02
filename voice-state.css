@@ -1,0 +1,33 @@
+.input-grid {
+  grid-template-columns: minmax(0, 1fr) 180px auto auto;
+}
+
+@media (max-width: 900px) {
+  .input-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.btn.mic.listening {
+  background: #c62828;
+  color: #fff;
+  box-shadow: 0 0 0 3px rgba(198, 40, 40, 0.16);
+}
+
+.btn.mic.listening:hover {
+  background: #a91f1f;
+}
+
+.btn.mic:focus-visible {
+  outline: 3px solid rgba(34, 102, 209, 0.35);
+  outline-offset: 2px;
+}
+
+.voice-alternative-note {
+  padding: 10px 12px;
+  border-left: 3px solid #bc6c16;
+  border-radius: 4px;
+  background: #fff8ed;
+  color: #684116;
+  font-size: 13px;
+}

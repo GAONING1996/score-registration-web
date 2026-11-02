@@ -3,14 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>成绩快速登记工具 v0.2.2 网页版</title>
+  <title>成绩快速登记工具 v0.2.6 网页版</title>
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="voice-state.css?v=0.2.6">
   <script src="vendor/xlsx.full.min.js"></script>
   <script src="vendor/pinyin-pro.js"></script>
 </head>
 <body>
   <header class="topbar">
-    <h1>成绩快速登记工具 <span>v0.2.2 网页版</span></h1>
+    <h1>成绩快速登记工具 <span>v0.2.6 网页版</span></h1>
     <p>上传当前 Excel，选择班级后，用语音或打字登记姓名与成绩。原文件不会被覆盖。</p>
   </header>
   <main class="wrap">
@@ -27,11 +28,12 @@
       <section class="panel entry-panel">
         <div class="section-title"><h2>同步录入 <small id="scopeText">请选择年级和班级</small></h2><button id="undoBtn" class="btn light" disabled>撤销上一条：暂无</button></div>
         <div class="input-grid">
-          <div class="field"><label for="nameInput">姓名或模糊线索</label><div class="name-input-row"><input id="nameInput" placeholder="输入即实时匹配：张宇、宇轩、zyx、yx" disabled><button id="micBtn" class="btn mic" disabled>开始连续语音</button></div></div>
+          <div class="field"><label for="nameInput">姓名或模糊线索</label><input id="nameInput" placeholder="输入即实时匹配：张宇、宇轩、zyx、yx" disabled></div>
           <div class="field"><label for="scoreInput">成绩</label><input id="scoreInput" placeholder="整数或小数" disabled></div>
+          <button id="micBtn" class="btn mic" type="button" aria-pressed="false" title="开始一次语音输入" disabled>开始语音</button>
           <button id="clearBtn" class="btn light" disabled>清除本条</button>
         </div>
-        <div class="hint">姓名输入会实时显示候选。可以说“姓名，85.5”，也可以分别填写姓名和成绩；语音结果仍需确认后登记。</div>
+        <div class="hint">姓名输入会实时显示候选。语音可说“姓名，85.5”；单次最长监听 15 秒，期间可反复重读更正。再次开始新语音会清除上一条语音草稿。</div>
         <div id="transcript" class="transcript">语音转写：尚未开始</div>
         <div id="candidateList" class="candidate-list"><div class="empty">上传 Excel 并选择班级后开始录入</div></div>
       </section>
@@ -46,6 +48,6 @@
   </main>
   <div id="modalBackdrop" class="modal-backdrop"><div class="modal"><h3 id="modalTitle">需要确认</h3><p id="modalText"></p><div id="modalBody"></div><div class="modal-actions"><button id="modalCancel" class="btn light">取消</button><button id="modalConfirm" class="btn primary">确认</button></div></div></div>
   <div id="toast" class="toast"></div>
-  <script src="app.js?v=0.2.2"></script>
+  <script src="app.js?v=0.2.6"></script>
 </body>
 </html>
